@@ -3,23 +3,12 @@
 
 #include <CL/cl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #pragma comment(lib, "OpenCL.lib")
 
-#define ROWS 2
-#define COLS 3
-
-#define CHECK(call) do { \
-    err = (call); \
-    if (err != CL_SUCCESS) { \
-        printf("OpenCL error %d at line %d\n", err, __LINE__); \
-        goto cleanup; \
-    } \
-} while (0)
-
-/* Функция транспонирования, выполняемая потоками GPU.
-   Каждый поток переносит один элемент матрицы. */
+/* Транспонирование матрицы на GPU */
 static const char* gpu_source =
 "__kernel void transpose(__global const int* a,\n"
 "                        __global int* b,\n"
@@ -30,79 +19,171 @@ static const char* gpu_source =
 "        b[j * rows + i] = a[i * cols + j];\n"
 "}\n";
 
-int main(void)
+/* Проверка одного размера матрицы */
+static int run_test(cl_context context,
+    cl_command_queue queue,
+    cl_kernel kernel,
+    int rows, int cols)
 {
-    int a[ROWS * COLS] = { 1, 2, 3, 4, 5, 6 };
-    int cpu[ROWS * COLS] = { 0 };
-    int gpu[ROWS * COLS] = { 0 };
+    size_t count = (size_t)rows * cols;
+    size_t bytes = count * sizeof(int);
 
-    cl_platform_id platforms[8];
-    cl_device_id device = NULL;
-    cl_uint platform_count = 0;
+    int* a = (int*)malloc(bytes);
+    int* cpu = (int*)malloc(bytes);
+    int* gpu = (int*)malloc(bytes);
+
+    cl_mem input = NULL;
+    cl_mem output = NULL;
     cl_int err = CL_SUCCESS;
+    int success = 0;
 
-    cl_context context = NULL;
-    cl_command_queue queue = NULL;
-    cl_program program = NULL;
-    cl_kernel kernel = NULL;
-    cl_mem input_buffer = NULL;
-    cl_mem output_buffer = NULL;
+    if (!a || !cpu || !gpu) {
+        printf("Memory allocation failed.\n");
+        goto cleanup;
+    }
 
-    int result = 1;
+    /* Заполнение исходной матрицы */
+    for (size_t k = 0; k < count; k++)
+        a[k] = (int)((k * 37u + 11u) % 100003u);
 
-    /* Транспонирование на CPU.
-       Строки исходной матрицы становятся столбцами. */
-    for (int i = 0; i < ROWS; i++) {
-        for (int j = 0; j < COLS; j++) {
-            cpu[j * ROWS + i] = a[i * COLS + j];
+    /* Последовательное транспонирование на CPU */
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            cpu[j * rows + i] = a[i * cols + j];
         }
     }
 
-    /* Поиск доступной платформы OpenCL и видеокарты. */
-    CHECK(clGetPlatformIDs(8, platforms, &platform_count));
+    /* Подготовка памяти GPU */
+    input = clCreateBuffer(context,
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        bytes, a, &err);
+
+    if (err != CL_SUCCESS || !input)
+        goto cleanup;
+
+    output = clCreateBuffer(context,
+        CL_MEM_WRITE_ONLY, bytes, NULL, &err);
+
+    if (err != CL_SUCCESS || !output)
+        goto cleanup;
+
+    err = clSetKernelArg(kernel, 0, sizeof(input), &input);
+    if (err != CL_SUCCESS) goto cleanup;
+
+    err = clSetKernelArg(kernel, 1, sizeof(output), &output);
+    if (err != CL_SUCCESS) goto cleanup;
+
+    err = clSetKernelArg(kernel, 2, sizeof(rows), &rows);
+    if (err != CL_SUCCESS) goto cleanup;
+
+    err = clSetKernelArg(kernel, 3, sizeof(cols), &cols);
+    if (err != CL_SUCCESS) goto cleanup;
+
+    /* Параллельное транспонирование на GPU */
+    size_t global[2] = {
+        (size_t)cols,
+        (size_t)rows
+    };
+
+    err = clEnqueueNDRangeKernel(queue, kernel,
+        2, NULL, global, NULL, 0, NULL, NULL);
+
+    if (err != CL_SUCCESS) goto cleanup;
+
+    err = clEnqueueReadBuffer(queue, output,
+        CL_TRUE, 0, bytes, gpu, 0, NULL, NULL);
+
+    if (err != CL_SUCCESS) goto cleanup;
+
+    /* Сравнение результатов CPU и GPU */
+    if (memcmp(cpu, gpu, bytes) == 0) {
+        printf("Matrix %d x %d: OK\n", rows, cols);
+        success = 1;
+    }
+    else {
+        printf("Matrix %d x %d: FAILED\n", rows, cols);
+    }
+
+cleanup:
+    if (!success && err != CL_SUCCESS)
+        printf("OpenCL error: %d\n", err);
+
+    if (input) clReleaseMemObject(input);
+    if (output) clReleaseMemObject(output);
+
+    free(a);
+    free(cpu);
+    free(gpu);
+
+    return success;
+}
+
+int main(void)
+{
+    cl_platform_id platforms[8];
+    cl_platform_id selected_platform = NULL;
+    cl_device_id device = NULL;
+    cl_uint platform_count = 0;
+    cl_int err;
+
+    /* Поиск видеокарты с поддержкой OpenCL */
+    err = clGetPlatformIDs(8, platforms, &platform_count);
+
+    if (err != CL_SUCCESS || platform_count == 0) {
+        printf("OpenCL platform not found.\n");
+        return 1;
+    }
 
     if (platform_count > 8)
         platform_count = 8;
 
-    for (cl_uint p = 0; p < platform_count; p++) {
-        err = clGetDeviceIDs(platforms[p],
+    for (cl_uint i = 0; i < platform_count; i++) {
+        err = clGetDeviceIDs(platforms[i],
             CL_DEVICE_TYPE_GPU, 1, &device, NULL);
 
-        if (err == CL_SUCCESS)
+        if (err == CL_SUCCESS) {
+            selected_platform = platforms[i];
             break;
-
-        device = NULL;
+        }
     }
 
-    if (device == NULL) {
-        printf("OpenCL GPU not found.\n");
-        goto cleanup;
+    if (!device || !selected_platform) {
+        printf("GPU not found.\n");
+        return 1;
     }
 
-    char device_name[256] = { 0 };
+    char name[256] = { 0 };
 
-    CHECK(clGetDeviceInfo(device, CL_DEVICE_NAME,
-        sizeof(device_name), device_name, NULL));
+    err = clGetDeviceInfo(device, CL_DEVICE_NAME,
+        sizeof(name), name, NULL);
 
-    printf("GPU device: %s\n\n", device_name);
+    if (err != CL_SUCCESS)
+        return 1;
 
-    /* Создание контекста и очереди команд для GPU. */
+    printf("GPU: %s\n\n", name);
+
+    /* Создание окружения OpenCL */
+    cl_context context = NULL;
+    cl_command_queue queue = NULL;
+    cl_program program = NULL;
+    cl_kernel kernel = NULL;
+    int result = 1;
+
     context = clCreateContext(NULL, 1, &device,
         NULL, NULL, &err);
 
-    if (err != CL_SUCCESS || context == NULL)
+    if (err != CL_SUCCESS || !context)
         goto cleanup;
 
     queue = clCreateCommandQueue(context, device, 0, &err);
 
-    if (err != CL_SUCCESS || queue == NULL)
+    if (err != CL_SUCCESS || !queue)
         goto cleanup;
 
-    /* Компиляция программы транспонирования для GPU. */
-    program = clCreateProgramWithSource(context, 1,
-        &gpu_source, NULL, &err);
+    program = clCreateProgramWithSource(context,
+        1, &gpu_source, NULL, &err);
 
-    if (err != CL_SUCCESS || program == NULL)
+    if (err != CL_SUCCESS || !program)
         goto cleanup;
 
     err = clBuildProgram(program, 1, &device,
@@ -112,88 +193,47 @@ int main(void)
         char log[4096] = { 0 };
 
         clGetProgramBuildInfo(program, device,
-            CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+            CL_PROGRAM_BUILD_LOG,
+            sizeof(log), log, NULL);
 
-        printf("Kernel build error:\n%s\n", log);
+        printf("Build error:\n%s\n", log);
         goto cleanup;
     }
 
     kernel = clCreateKernel(program, "transpose", &err);
 
-    if (err != CL_SUCCESS || kernel == NULL)
+    if (err != CL_SUCCESS || !kernel)
         goto cleanup;
 
-    /* Выделение памяти GPU и передача исходной матрицы. */
-    input_buffer = clCreateBuffer(context,
-        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        sizeof(a), a, &err);
+    /* Размеры матриц для тестирования */
+    const int sizes[][2] = {
+        {2, 3},
+        {256, 256},
+        {512, 512},
+        {1024, 1024},
+        {2048, 2048},
+        {512, 1024}
+    };
 
-    if (err != CL_SUCCESS || input_buffer == NULL)
-        goto cleanup;
+    int total = (int)(sizeof(sizes) / sizeof(sizes[0]));
+    int passed = 0;
 
-    output_buffer = clCreateBuffer(context,
-        CL_MEM_WRITE_ONLY, sizeof(gpu), NULL, &err);
-
-    if (err != CL_SUCCESS || output_buffer == NULL)
-        goto cleanup;
-
-    int rows = ROWS;
-    int cols = COLS;
-
-    CHECK(clSetKernelArg(kernel, 0,
-        sizeof(input_buffer), &input_buffer));
-
-    CHECK(clSetKernelArg(kernel, 1,
-        sizeof(output_buffer), &output_buffer));
-
-    CHECK(clSetKernelArg(kernel, 2,
-        sizeof(rows), &rows));
-
-    CHECK(clSetKernelArg(kernel, 3,
-        sizeof(cols), &cols));
-
-    /* Запуск параллельного транспонирования на GPU. */
-    size_t global[2] = { COLS, ROWS };
-
-    CHECK(clEnqueueNDRangeKernel(queue, kernel,
-        2, NULL, global, NULL, 0, NULL, NULL));
-
-    /* Получение результата вычислений с GPU. */
-    CHECK(clEnqueueReadBuffer(queue, output_buffer,
-        CL_TRUE, 0, sizeof(gpu), gpu,
-        0, NULL, NULL));
-
-    printf("CPU result:\n");
-
-    for (int i = 0; i < COLS; i++) {
-        for (int j = 0; j < ROWS; j++)
-            printf("%d ", cpu[i * ROWS + j]);
-
-        printf("\n");
+    for (int i = 0; i < total; i++) {
+        passed += run_test(context, queue, kernel,
+            sizes[i][0], sizes[i][1]);
     }
 
-    printf("\nGPU result:\n");
+    printf("\nTests passed: %d/%d\n", passed, total);
 
-    for (int i = 0; i < COLS; i++) {
-        for (int j = 0; j < ROWS; j++)
-            printf("%d ", gpu[i * ROWS + j]);
-
-        printf("\n");
-    }
-
-    /* Проверка совпадения результатов CPU и GPU. */
-    if (memcmp(cpu, gpu, sizeof(cpu)) == 0) {
-        printf("\nCPU and GPU results match!\n");
+    if (passed == total) {
+        printf("All tests passed!\n");
         result = 0;
     }
     else {
-        printf("\nERROR: Results differ!\n");
+        printf("Some tests failed.\n");
     }
 
 cleanup:
-    /* Освобождение ресурсов OpenCL. */
-    if (output_buffer) clReleaseMemObject(output_buffer);
-    if (input_buffer) clReleaseMemObject(input_buffer);
     if (kernel) clReleaseKernel(kernel);
     if (program) clReleaseProgram(program);
     if (queue) clReleaseCommandQueue(queue);
